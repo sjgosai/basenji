@@ -24,10 +24,14 @@ import time
 
 import h5py
 import numpy as np
+import pandas as pd
 import pyBigWig
 import pysam
 
-import basenji
+from basenji import dna_io
+from basenji import gff
+from basenji import gene
+
 """basenji_hdf5_genes.py
 
 Tile a set of genes and save the result in HDF5 for Basenji processing.
@@ -47,7 +51,7 @@ def main():
   parser.add_option(
       '-g',
       dest='genome_file',
-      default='%s/assembly/human.hg19.genome' % os.environ['HG19'],
+      default=None,
       help='Chromosome lengths file [Default: %default]')
   parser.add_option(
       '-l',
@@ -101,10 +105,10 @@ def main():
   # organize TSS's by chromosome
 
   # read transcripts
-  transcripts = basenji.gff.read_genes(gtf_file, key_id='transcript_id')
+  transcripts = gff.read_genes(gtf_file, key_id='transcript_id')
 
   # read transcript --> gene mapping
-  transcript_genes = basenji.gff.t2g(gtf_file, feature='exon')
+  transcript_genes = gff.t2g(gtf_file, feature='exon')
 
   # make gene --> strand mapping
   gene_strand = {}
@@ -191,7 +195,7 @@ def main():
         seq_index = len(seq_coords)-1
         for i in range(left_i,right_i+1):
           tss_pos, gene_id = ctss[i]
-          tss = basenji.gene.TSS('TSS%d'%len(tss_list), gene_id, chrom, tss_pos, seq_index, True, gene_strand[gene_id])
+          tss = gene.TSS('TSS%d'%len(tss_list), gene_id, chrom, tss_pos, seq_index, True, gene_strand[gene_id])
           tss_list.append(tss)
 
       # update
@@ -205,15 +209,13 @@ def main():
     t0 = time.time()
 
     # get wig files and labels
+    target_wigs_df = pd.read_table(options.target_wigs_file, index_col=0)
     target_wigs = OrderedDict()
     target_labels = []
-    for line in open(options.target_wigs_file):
-      a = line.rstrip().split('\t')
-      target_wigs[a[0]] = a[1]
-      if len(a) > 2:
-        target_labels.append(a[2])
-      else:
-        target_labels.append('')
+    for i in range(target_wigs_df.shape[0]):
+      target_wig_series = target_wigs_df.iloc[i]
+      target_wigs[target_wig_series.identifier] = target_wig_series.file
+      target_labels.append(target_wig_series.description)
 
     # initialize multiprocessing pool
     pool = multiprocessing.Pool(options.processes)
@@ -238,7 +240,7 @@ def main():
 
   for chrom, start, end in seq_coords:
     seq = fasta.fetch(chrom, start, end)
-    seqs_1hot.append(basenji.dna_io.dna_1hot(seq))
+    seqs_1hot.append(dna_io.dna_1hot(seq))
 
   seqs_1hot = np.array(seqs_1hot)
 
@@ -351,9 +353,8 @@ def bigwig_tss_targets(wig_file, tss_list, seq_coords, pool_width=1):
 
 ################################################################################
 def check_wigs(target_wigs_file):
-  for line in open(target_wigs_file):
-    a = line.rstrip().split('\t')
-    wig_file = a[1]
+  target_wigs_df = pd.read_table(target_wigs_file, index_col=0)
+  for wig_file in target_wigs_df.file:
     if not os.path.isfile(wig_file):
       print('Cannot find %s' % wig_file, file=sys.stderr)
       exit(1)
@@ -408,7 +409,7 @@ def cluster_tss(transcript_genes, transcripts, merge_distance):
 def wig5_tss_targets(w5_file, tss_list, seq_coords, pool_width=1):
   ''' Read gene target values from a bigwig
   Args:
-    wig_file: wiggle HDF5 filename
+    w5_file: wiggle HDF5 filename
     tss_list: list of TSS instances
     seq_coords: list of (chrom,start,end) sequence coordinates
     pool_width: average pool adjacent nucleotides of this width
@@ -443,12 +444,12 @@ def wig5_tss_targets(w5_file, tss_list, seq_coords, pool_width=1):
 
     except RuntimeError:
       if seq_chrom not in warned_chroms:
-        print("WARNING: %s doesn't see %s (%s:%d-%d). Setting to all zeros. No additional warnings will be offered for %s" % (wig_file,tss.identifier,seq_chrom,seq_start,seq_end,seq_chrom), file=sys.stderr)
+        print("WARNING: %s doesn't see %s (%s:%d-%d). Setting to all zeros. No additional warnings will be offered for %s" % (w5_file,tss.identifier,seq_chrom,seq_start,seq_end,seq_chrom), file=sys.stderr)
         warned_chroms.add(seq_chrom)
 
     # check NaN
     if np.isnan(tss_targets[tss_i]):
-      print('WARNING: %s (%s:%d-%d) pulled NaN from %s. Setting to zero.' % (tss.identifier, seq_chrom, seq_start, seq_end, wig_file), file=sys.stderr)
+      print('WARNING: %s (%s:%d-%d) pulled NaN from %s. Setting to zero.' % (tss.identifier, seq_chrom, seq_start, seq_end, w5_file), file=sys.stderr)
       tss_targets[tss_i] = 0
 
   # close w5 file

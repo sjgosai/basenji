@@ -2,12 +2,14 @@
 from optparse import OptionParser
 import collections
 import functools
+import os
 import pdb
 import sys
 
 import numpy as np
 import pandas as pd
-import zarr
+import h5py
+from tqdm import tqdm
 
 from google.cloud import bigquery
 
@@ -17,6 +19,8 @@ import dash_core_components as dcc
 import dash_html_components as html
 import dash_table_experiments as dt
 import plotly.graph_objs as go
+
+from basenji.sad5 import ChrSAD5
 
 '''
 basenji_fetch_app.py
@@ -28,32 +32,24 @@ Run a Dash app to enable SAD queries.
 # main
 ################################################################################
 def main():
-    usage = 'usage: %prog [options] <sad_zarr_file>'
+    usage = 'usage: %prog [options] <sad_hdf5_path>'
     parser = OptionParser(usage)
-    # parser.add_option('--ld', dest='ld_query', default=False, action='store_true')
+    parser.add_option('-c', dest='chrom_hdf5',
+        default=False, action='store_true',
+        help='HDF5 files split by chromosome [Default: %default]')
     (options,args) = parser.parse_args()
 
     if len(args) != 1:
-        parser.error('Must provide SAD zarr')
+        parser.error('Must provide SAD HDF5')
     else:
-        sad_zarr_file = args[0]
+        sad_h5_path = args[0]
 
     #############################################
     # precursors
 
-    sad_zarr_in = zarr.open_group(sad_zarr_file)
-
-    # hash SNP ids to indexes
-    snp_indexes = {}
-    for i, snp_id in enumerate(sad_zarr_in['snps']):
-        snp_indexes[snp_id] = i
-
-    # easy access to target information
-    target_ids = np.array(sad_zarr_in['target_ids'])
-    target_labels = np.array(sad_zarr_in['target_labels'])
-
-    # initialize BigQuery client
-    client = bigquery.Client('seqnn-170614')
+    print('Preparing data...', end='', flush=True)
+    sad5 = ChrSAD5(sad_h5_path, index_chr=True)
+    print('DONE.', flush=True)
 
     #############################################
     # layout
@@ -74,9 +70,10 @@ def main():
                     options=[
                         {'label':'CAGE', 'value':'CAGE'},
                         {'label':'DNase', 'value':'DNASE'},
-                        {'label':'H3K4me3', 'value':'HISTONE:H3K4me3'}
+                        {'label':'H3K4me3', 'value':'CHIP:H3K4me3'},
+                        {'label':'All', 'value':'All'}
                     ],
-                    value='DNASE'
+                    value='CAGE'
                 )
             ], style={'width': '250', 'display': 'inline-block'}),
 
@@ -92,13 +89,13 @@ def main():
                         {'label':'1kG European', 'value':'EUR'},
                         {'label':'1kG South Asian', 'value':'SAS'}
                     ],
-                    value='-'
+                    value='EUR'
                 )
             ], style={'width': '250', 'display': 'inline-block'}),
 
             html.Div([
                 html.Label('SNP ID'),
-                dcc.Input(id='snp_id', value='rs2157719', type='text'),
+                dcc.Input(id='snp_id', value='rs6656401', type='text'),
                 html.Button(id='snp_submit', n_clicks=0, children='Submit')
             ], style={'display': 'inline-block', 'float': 'right'})
 
@@ -114,8 +111,8 @@ def main():
             dt.DataTable(
                 id='table',
                 rows=[],
-                columns=['SNP', 'Association', 'Score', 'R2', 'Experiment', 'Description'],
-                column_widths=[150, 125, 125, 125, 200],
+                columns=['SNP', 'Association', 'Score', 'ScoreQ', 'R', 'Experiment', 'Description'],
+                column_widths=[150, 125, 125, 125, 125, 200],
                 editable=False,
                 filterable=True,
                 sortable=True,
@@ -133,72 +130,80 @@ def main():
     # callback helpers
 
     @memoized
-    def query_ld(snp_id, population):
-        bq_path = 'genomics-public-data.linkage_disequilibrium_1000G_phase_3'
+    def query_ld(population, snp_id):
+        try:
+            sad5.set_population(population)
 
-        # construct query
-        query = 'SELECT tname, corr'
-        query += ' FROM `%s.super_pop_%s`' % (bq_path,population)
-        query += ' WHERE qname = "%s"' % snp_id
+        except ValueError:
+            print('Population unavailable.', file=sys.stderr)
+            return pd.DataFrame()
 
-        # run query
-        print('Running a BigQuery!', file=sys.stderr)
-        query_results = client.query(query)
+        chrm, snp_i = sad5.snp_chr_index(snp_id)
+        pos = sad5.snp_pos(snp_i, chrm)
 
-        return query_results
+        if chrm is None:
+            return pd.DataFrame()
+        else:
+            return sad5.emerald_vcf.query_ld(snp_id, chrm, pos, ld_threshold=0.8)
 
     @memoized
-    def read_sad(snp_i):
-        print('Reading SAD!', file=sys.stderr)
-        return sad_zarr_in['sad'][snp_i,:].astype('float64')
+    def read_sad(chrm, snp_i, verbose=True):
+        """Read SAD scores from HDF5 for the given SNP index."""
+        if verbose:
+            print('Reading SAD!', file=sys.stderr)
 
-    def snp_rows(snp_id, dataset, ld_r2=1.):
+        # read SAD
+        snp_sad = sad5.chr_sad5[chrm][snp_i].astype('float64')
+
+        # read percentiles
+        snp_pct = sad5.chr_sad5[chrm].sad_pct(snp_sad)
+
+        return snp_sad, snp_pct
+
+    def snp_rows(snp_id, dataset, ld_r=1., verbose=True):
+        """Construct table rows for the given SNP id and its LD set
+           in the given dataset."""
         rows = []
 
         # search for SNP
-        if snp_id in snp_indexes:
-            snp_i = snp_indexes[snp_id]
+        # chrom, snp_i = snp_indexes.get(snp_id, (None,None))
+        chrm, snp_i = sad5.snp_chr_index(snp_id)
+
+        if chrm is not None:
+            # SAD
+            snp_sad, snp_pct = read_sad(chrm, snp_i)
 
             # round floats
-            snp_sad = np.around(read_sad(snp_i),4)
-            snp_assoc = np.around(snp_sad*ld_r2, 4)
-            ld_r2_round = np.around(ld_r2, 4)
+            snp_sad = np.around(snp_sad,4)
+            snp_assoc = np.around(snp_sad*ld_r, 4)
+            ld_r_round = np.around(ld_r, 4)
 
             # extract target scores and info
-            for ti, tid in enumerate(target_ids):
-                if target_labels[ti].startswith(dataset):
+            for ti, tid in enumerate(sad5.target_ids):
+                if dataset == 'All' or sad5.target_labels[ti].startswith(dataset):
                     rows.append({
                         'SNP': snp_id,
                         'Association': snp_assoc[ti],
                         'Score': snp_sad[ti],
-                        'R2': ld_r2_round,
+                        'ScoreQ': snp_pct[ti],
+                        'R': ld_r_round,
                         'Experiment': tid,
-                        'Description': target_labels[ti]})
+                        'Description': sad5.target_labels[ti]})
+        elif verbose:
+            print('Cannot find %s in snp_indexes.' % snp_id)
 
         return rows
 
     def make_data_mask(dataset):
+        """Make a mask across targets for the given dataset."""
         dataset_mask = []
-        for ti, tid in enumerate(target_ids):
-            dataset_mask.append(target_labels[ti].startswith(dataset))
+        for ti, tid in enumerate(sad5.target_ids):
+            if dataset == 'All':
+                dataset_mask.append(True)
+            else:
+                dataset_mask.append(sad5.target_labels[ti].startswith(dataset))
         return np.array(dataset_mask, dtype='bool')
 
-    def snp_scores(snp_id, dataset, ld_r2=1.):
-        dataset_mask = make_data_mask(dataset)
-
-        scores = np.zeros(dataset_mask.sum(), dtype='float64')
-
-        # search for SNP
-        if snp_id in snp_indexes:
-            snp_i = snp_indexes[snp_id]
-
-            # read SAD
-            snp_sad = read_sad(snp_i)[dataset_mask]
-
-            # add
-            scores += snp_sad*ld_r2
-
-        return scores
 
     #############################################
     # callbacks
@@ -212,17 +217,50 @@ def main():
             dd.State('population','value')
         ]
     )
-    def update_table(n_clicks, snp_id, dataset, population):
-        print('Tabling')
+    def update_table(n_clicks, snp_id, dataset, population, verbose=True):
+        """Update the table with a new parameter set."""
+        if verbose:
+            print('Tabling')
 
-        # add snp_id rows
-        rows = snp_rows(snp_id, dataset)
+        # look up SNP index
+        chrm, snp_i = sad5.snp_chr_index(snp_id)
 
-        if population != '-':
-            query_results = query_ld(snp_id, population)
+        # look up position
+        pos = sad5.snp_pos(snp_i, chrm)
 
-            for ld_snp, ld_corr in query_results:
-                rows += snp_rows(ld_snp, dataset, ld_corr)
+        # set population
+        try:
+            sad5.set_population(population)
+        except ValueError:
+            print('Population unavailable.', file=sys.stderr)
+
+        # retrieve scores and LD
+        snp_ldscores, df_ld, snps_scores = sad5.retrieve_snp(snp_id, chrm, pos, ld_t=0.5)
+
+        # construct rows
+        rows = []
+
+        # for each SNP
+        for i, v in tqdm(df_ld.iterrows()):
+            # round floats
+            snp_sad = np.around(snps_scores[i], 4)
+            snp_assoc = np.around(snp_sad*v.r, 4)
+            ld_r_round = np.around(v.r, 4)
+
+            # read percentiles
+            snp_pct = sad5.chr_sad5[chrm].sad_pct(snp_sad)
+
+            # for each target
+            for ti, tid in enumerate(sad5.target_ids):
+                if dataset == 'All' or sad5.target_labels[ti].startswith(dataset):
+                    rows.append({
+                        'SNP': v.snp,
+                        'Association': snp_assoc[ti],
+                        'Score': snp_sad[ti],
+                        'ScoreQ': snp_pct[ti],
+                        'R': ld_r_round,
+                        'Experiment': tid,
+                        'Description': sad5.target_labels[ti]})
 
         return rows
 
@@ -235,39 +273,49 @@ def main():
             dd.State('population','value')
         ]
     )
-    def update_plot(n_clicks, snp_id, dataset, population):
-        print('Plotting')
+    def update_plot(n_clicks, snp_id, dataset, population, verbose=True):
+        if verbose:
+            print('Plotting')
 
         target_mask = make_data_mask(dataset)
 
-        # add snp_id rows
-        query_scores = snp_scores(snp_id, dataset)
+        # look up SNP index
+        chrm, snp_i = sad5.snp_chr_index(snp_id)
 
-        if population != '-':
-            query_results = query_ld(snp_id, population)
+        # look up position
+        pos = sad5.snp_pos(snp_i, chrm)
 
-            for ld_snp, ld_corr in query_results:
-                query_scores += snp_scores(ld_snp, dataset, ld_corr)
+        # set population
+        try:
+            sad5.set_population(population)
+        except ValueError:
+            print('Population unavailable.', file=sys.stderr)
+
+        # retrieve scores and LD
+        snp_ldscores, df_ld, snps_scores = sad5.retrieve_snp(snp_id, chrm, pos, ld_t=0.5)
+
+        # mask
+        snp_ldscores = snp_ldscores[target_mask]
 
         # sort
-        sorted_indexes = np.argsort(query_scores)
+        sorted_indexes = np.argsort(snp_ldscores)
 
         # range
-        ymax = np.abs(query_scores).max()
+        ymax = np.abs(snp_ldscores).max()
         ymax *= 1.2
 
         return {
             'data': [go.Scatter(
-                x=np.arange(len(query_scores)),
-                y=query_scores[sorted_indexes],
-                text=target_ids[target_mask][sorted_indexes],
+                x=np.arange(len(snp_ldscores)),
+                y=snp_ldscores[sorted_indexes],
+                text=sad5.target_ids[target_mask][sorted_indexes],
                 mode='markers'
             )],
             'layout': {
                 'height': 400,
                 'margin': {'l': 20, 'b': 30, 'r': 10, 't': 10},
                 'yaxis': {'range': [-ymax,ymax]},
-                'xaxis': {'range': [-1,1+len(query_scores)]}
+                'xaxis': {'range': [-1,1+len(snp_ldscores)]}
             }
         }
 
@@ -275,7 +323,7 @@ def main():
     # run
 
     app.scripts.config.serve_locally = True
-    app.run_server(debug=True)
+    app.run_server(debug=False, port=8787)
 
 
 class memoized(object):

@@ -25,7 +25,7 @@ import basenji.dna_io
 from basenji.gene import TSS, GeneSeq
 
 class GeneData:
-  def __init__(self, genes_hdf5_file, worker_index=None, workers=None, read_1hot=True):
+  def __init__(self, genes_hdf5_file, worker_index=None, workers=None, read_1hot=True, read_targets=True):
     # open HDF5
     self.genes_hdf5_in = h5py.File(genes_hdf5_file)
 
@@ -69,7 +69,7 @@ class GeneData:
       self.tss.append(tss)
 
       # append to GeneSeq
-      tss_seq.tss_list.append(tss)
+      tss_seq.append_tss(tss)
 
     self.num_tss = len(self.tss)
 
@@ -104,7 +104,7 @@ class GeneData:
     #########################################
     # target information
 
-    if 'tss_targets' in self.genes_hdf5_in:
+    if 'tss_targets' in self.genes_hdf5_in and read_targets:
       self.tss_targets = self.genes_hdf5_in['tss_targets']
       self.target_labels = [tl.decode('UTF-8') for tl in self.genes_hdf5_in['target_labels']]
       if 'target_ids' in self.genes_hdf5_in:   # TEMP

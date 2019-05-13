@@ -33,7 +33,8 @@ import pysam
 
 import slurm
 
-import basenji
+from basenji import dna_io
+from basenji import genome
 
 '''
 basenji_hdf5.py
@@ -173,10 +174,7 @@ def main():
       print('WARNING: duplicate target id %s' % a[0], file=sys.stderr)
 
     target_wigs[a[0]] = a[1]
-    if len(a) > 2:
-      target_strands.append(a[2])
-    else:
-      target_strands.append('*')
+    target_strands.append(a[2])
     if len(a) > 3:
       target_labels.append(a[3])
     else:
@@ -192,11 +190,11 @@ def main():
   ################################################################
   # prepare genomic segments
   ################################################################
-  chrom_segments = basenji.genome.load_chromosomes(fasta_file)
+  chrom_segments = genome.load_chromosomes(fasta_file)
 
   # remove gaps
   if options.gaps_file:
-    chrom_segments = basenji.genome.split_contigs(chrom_segments,
+    chrom_segments = genome.split_contigs(chrom_segments,
                                                   options.gaps_file)
 
   # ditch the chromosomes
@@ -345,9 +343,9 @@ def main():
       set(range(len(seqs_segments))) - set(valid_indexes) - set(test_indexes))
 
   # training may require shuffling
-  random.shuffle(sorted(train_indexes))
-  random.shuffle(sorted(valid_indexes))
-  random.shuffle(sorted(test_indexes))
+  random.shuffle(train_indexes)
+  random.shuffle(valid_indexes)
+  random.shuffle(test_indexes)
 
   # write to HDF5
   hdf5_out = h5py.File(hdf5_file, 'w')
@@ -652,7 +650,7 @@ def segments_1hot(fasta_file, segments, seq_length, stride):
     bend = bstart + seq_length
     while bend < len(seg_seq):
       # append
-      seqs_1hot.append(basenji.dna_io.dna_1hot(seg_seq[bstart:bend]))
+      seqs_1hot.append(dna_io.dna_1hot(seg_seq[bstart:bend]))
 
       seqs_segments.append((chrom, seg_start + bstart, seg_start + bend))
 

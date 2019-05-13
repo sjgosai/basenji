@@ -61,6 +61,12 @@ class Batcher:
 
     self.reset()
 
+  def empty(self):
+    return self.start >= self.num_seqs
+
+  def remaining(self):
+    return self.num_seqs - self.start
+
   def next(self, fwdrc=True, shift=0):
     """ Load the next batch from the HDF5. """
     Xb = None
@@ -78,7 +84,7 @@ class Batcher:
 
       # initialize
       Xb = np.zeros(
-          (self.batch_size, self.seq_len, self.seq_depth), dtype='float32')
+          (Nb, self.seq_len, self.seq_depth), dtype='float32')
       if self.Yf is not None:
         if self.Yf.dtype == np.uint8:
           ytype = 'int32'
@@ -86,11 +92,11 @@ class Batcher:
           ytype = 'float32'
 
         Yb = np.zeros(
-            (self.batch_size, self.seq_len // self.pool_width,
+            (Nb, self.seq_len // self.pool_width,
              self.num_targets),
             dtype=ytype)
         NAb = np.zeros(
-            (self.batch_size, self.seq_len // self.pool_width), dtype='bool')
+            (Nb, self.seq_len // self.pool_width), dtype='bool')
 
       # copy data
       for i in range(Nb):
@@ -118,7 +124,7 @@ class Batcher:
         NAb = NAb[:, ::-1]
 
     # update start
-    self.start = stop
+    self.start = min(stop, self.num_seqs)
 
     return Xb, Yb, NAb, Nb
 

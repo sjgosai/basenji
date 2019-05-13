@@ -27,7 +27,10 @@ import pyBigWig
 from scipy.stats import ttest_1samp
 import tensorflow as tf
 
-import basenji
+from basenji import batcher
+from basenji import genedata
+from basenji import params
+from basenji import seqnn
 
 from basenji_test import bigwig_open
 
@@ -44,45 +47,27 @@ the genomic region.
 def main():
   usage = 'usage: %prog [options] <params_file> <model_file> <genes_hdf5_file>'
   parser = OptionParser(usage)
-  parser.add_option(
-      '-g',
-      dest='genome_file',
-      default='%s/assembly/human.hg19.genome' % os.environ['HG19'],
+  parser.add_option('-g', dest='genome_file',
+      default='%s/data/human.hg38.genome' % os.environ['BASENJIDIR'],
       help='Chromosome lengths file [Default: %default]')
-  parser.add_option(
-      '-l',
-      dest='gene_list',
+  parser.add_option('-l', dest='gene_list',
       help='Process only gene ids in the given file')
-  parser.add_option(
-      '--mc',
-      dest='mc_n',
-      default=0,
-      type='int',
+  parser.add_option('--mc', dest='mc_n',
+      default=0, type='int',
       help='Monte carlo test iterations [Default: %default]')
-  parser.add_option('-n',
-      dest='norm',
-      default=None,
-      type='int',
+  parser.add_option('-n', dest='norm',
+      default=None, type='int',
       help='Compute saliency norm [Default% default]')
-  parser.add_option(
-      '-o',
-      dest='out_dir',
+  parser.add_option('-o', dest='out_dir',
       default='grad_map',
       help='Output directory [Default: %default]')
-  parser.add_option(
-      '--rc',
-      dest='rc',
-      default=False,
-      action='store_true',
+  parser.add_option('--rc', dest='rc',
+      default=False, action='store_true',
       help='Average the forward and reverse complement predictions when testing [Default: %default]')
-  parser.add_option(
-      '--shifts',
-      dest='shifts',
+  parser.add_option('--shifts', dest='shifts',
       default='0',
       help='Ensemble prediction shifts [Default: %default]')
-  parser.add_option(
-      '-t',
-      dest='target_indexes',
+  parser.add_option('-t', dest='target_indexes',
       default=None,
       help='Target indexes to plot')
   (options, args) = parser.parse_args()
@@ -102,7 +87,7 @@ def main():
   #################################################################
   # reads in genes HDF5
 
-  gene_data = basenji.genedata.GeneData(genes_hdf5_file)
+  gene_data = genedata.GeneData(genes_hdf5_file)
 
   # subset gene sequences
   genes_subset = set()
@@ -121,7 +106,7 @@ def main():
   #######################################################
   # model parameters and placeholders
 
-  job = basenji.dna_io.read_job_params(params_file)
+  job = params.read_job_params(params_file)
 
   job['seq_length'] = gene_data.seq_length
   job['seq_depth'] = gene_data.seq_depth
@@ -142,11 +127,12 @@ def main():
     target_subset = None
 
   # build model
-  model = basenji.seqnn.SeqNN()
-  model.build(job, target_subset=target_subset)
+  model = seqnn.SeqNN()
+  model.build_feed(job, target_subset=target_subset)
 
   # determine latest pre-dilated layer
-  dilated_mask = np.array(model.cnn_dilation) > 1
+  cnn_dilation = np.array([cp.dilation for cp in model.hp.cnn_params])
+  dilated_mask = cnn_dilation > 1
   dilated_indexes = np.where(dilated_mask)[0]
   pre_dilated_layer = np.min(dilated_indexes)
   print('Pre-dilated layer: %d' % pre_dilated_layer)
@@ -177,14 +163,14 @@ def score_write(sess, model, options, seqs_1hot, seqs_chrom, seqs_start):
 
   for si in range(seqs_1hot.shape[0]):
     # initialize batcher
-    batcher = basenji.batcher.Batcher(seqs_1hot[si:si+1],
-                                      batch_size=model.batch_size,
-                                      pool_width=model.target_pool)
+    batcher_si = batcher.Batcher(seqs_1hot[si:si+1],
+                                 batch_size=model.hp.batch_size,
+                                 pool_width=model.hp.target_pool)
 
     # get layer representations
     t0 = time.time()
     print('Computing gradients.', end='', flush=True)
-    _, _, _, batch_grads, batch_reprs, _ = model.gradients(sess, batcher,
+    _, _, _, batch_grads, batch_reprs, _ = model.gradients(sess, batcher_si,
       rc=options.rc, shifts=options.shifts, mc_n=options.mc_n, return_all=True)
     print(' Done in %ds.' % (time.time()-t0), flush=True)
 
@@ -238,8 +224,8 @@ def score_write(sess, model, options, seqs_1hot, seqs_chrom, seqs_start):
 
       # specify bigwig locations and values
       bw_chroms = [seqs_chrom[si]]*pooled_length
-      bw_starts = [int(seqs_start[si] + pi*model.target_pool) for pi in range(pooled_length)]
-      bw_ends = [int(bws + model.target_pool) for bws in bw_starts]
+      bw_starts = [int(seqs_start[si] + pi*model.hp.target_pool) for pi in range(pooled_length)]
+      bw_ends = [int(bws + model.hp.target_pool) for bws in bw_starts]
       bws_values = [float(bgs) for bgs in batch_grads_mean]
       # bwp_values = [float(bgp) for bgp in batch_grads_pval]
 

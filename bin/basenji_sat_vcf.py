@@ -17,7 +17,6 @@ from __future__ import print_function
 
 from optparse import OptionParser
 import os
-import pdb
 import sys
 
 import h5py
@@ -25,17 +24,29 @@ import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import tensorflow as tf
 
-import basenji
-import basenji_sat
+from basenji import batcher
+from basenji import params
+from basenji import seqnn
+from basenji import vcf
+from basenji_sat_h5 import delta_matrix, satmut_seqs, subplot_params
+from basenji_sat_h5 import plot_heat, plot_sad, plot_seqlogo
 
 '''
 basenji_sat_vcf.py
 
 Perform an in silico saturated mutagenesis of the sequences surrounding variants
 given in a VCF file.
+
+TODO:
+-Convert to tf.data following basenji_sat_bed.py. Unlike there, we can just make
+ the plots here.
+-Choose some plots, by computing cosine nearest neighbor graph between flattened
+ target profiles and cluster. Choose cluster representatives with largest variant
+ scores.
 '''
 
 ################################################################################
@@ -44,90 +55,49 @@ given in a VCF file.
 def main():
   usage = 'usage: %prog [options] <params_file> <model_file> <vcf_file>'
   parser = OptionParser(usage)
-  parser.add_option(
-      '-f',
-      dest='figure_width',
-      default=20,
-      type='float',
+  parser.add_option('-f', dest='figure_width',
+      default=20, type='float',
       help='Figure width [Default: %default]')
-  parser.add_option(
-      '--f1',
-      dest='genome1_fasta',
-      default='%s/assembly/hg19.fa' % os.environ['HG19'],
+  parser.add_option('--f1', dest='genome1_fasta',
+      default='%s/data/hg19.fa' % os.environ['BASENJIDIR'],
       help='Genome FASTA which which major allele sequences will be drawn')
-  parser.add_option(
-      '--f2',
-      dest='genome2_fasta',
+  parser.add_option('--f2', dest='genome2_fasta',
       default=None,
       help='Genome FASTA which which minor allele sequences will be drawn')
-  parser.add_option(
-      '-g',
-      dest='gain',
-      default=False,
-      action='store_true',
+  parser.add_option('-g', dest='gain',
+      default=False, action='store_true',
       help='Draw a sequence logo for the gain score, too [Default: %default]')
-  parser.add_option(
-      '-l',
-      dest='satmut_len',
-      default=200,
-      type='int',
+  # parser.add_option('-k', dest='plot_k',
+  #     default=None, type='int',
+  #     help='Plot the top k targets at each end.')
+  parser.add_option('-l', dest='satmut_len',
+      default=200, type='int',
       help='Length of centered sequence to mutate [Default: %default]')
-  parser.add_option(
-      '-m',
-      dest='mc_n',
-      default=0,
-      type='int',
+  parser.add_option('-m', dest='mc_n',
+      default=0, type='int',
       help='Monte carlo iterations [Default: %default]')
-  parser.add_option(
-      '--min',
-      dest='min_limit',
-      default=0.005,
-      type='float',
+  parser.add_option('--min', dest='min_limit',
+      default=0.01, type='float',
       help='Minimum heatmap limit [Default: %default]')
-  parser.add_option(
-      '-n',
-      dest='load_sat_npy',
-      default=False,
-      action='store_true',
+  parser.add_option('-n', dest='load_sat_npy',
+      default=False, action='store_true',
       help='Load the predictions from .npy files [Default: %default]')
-  parser.add_option(
-      '-o',
-      dest='out_dir',
-      default='heat',
+  parser.add_option('-o', dest='out_dir',
+      default='sat_vcf',
       help='Output directory [Default: %default]')
-  parser.add_option(
-      '--rc',
-      dest='rc',
-      default=False,
-      action='store_true',
-      help=
-      'Average the forward and reverse complement predictions when testing [Default: %default]'
-  )
-  parser.add_option(
-      '-s',
-      dest='seq_len',
-      default=131072,
-      type='int',
-      help='Input sequence length [Default: %default]')
-  parser.add_option(
-      '--shifts',
-      dest='shifts',
+  parser.add_option('--rc', dest='rc',
+      default=False, action='store_true',
+      help='Ensemble forward and reverse complement predictions [Default: %default]')
+  parser.add_option('--shifts', dest='shifts',
       default='0',
       help='Ensemble prediction shifts [Default: %default]')
-  parser.add_option(
-      '-t',
-      dest='targets',
-      default='0',
-      help=
-      'Comma-separated list of target indexes to plot (or -1 for all) [Default: %default]'
-  )
+  parser.add_option('-t', dest='targets_file',
+      default=None, type='str',
+      help='File specifying target indexes and labels in table format')
   (options, args) = parser.parse_args()
 
   if len(args) != 3:
-    parser.error(
-        'Must provide parameters and model files and input sequences (as a '
-        'FASTA file or test data in an HDF file'
-    )
+    parser.error('Must provide parameters and model files and VCF')
   else:
     params_file = args[0]
     model_file = args[1]
@@ -138,60 +108,61 @@ def main():
 
   options.shifts = [int(shift) for shift in options.shifts.split(',')]
 
-  # decide which targets to obtain
-  target_indexes = [int(ti) for ti in options.targets.split(',')]
-
   #################################################################
   # prep SNP sequences
   #################################################################
-  # load SNPs
-  snps = basenji.vcf.vcf_snps(vcf_file)
 
-  for si in range(len(snps)):
-    print(snps[si])
+  # read parameters
+  job = params.read_job_params(params_file, require=['seq_length', 'num_targets'])
+
+  # load SNPs
+  snps = vcf.vcf_snps(vcf_file)
 
   # get one hot coded input sequences
   if not options.genome2_fasta:
-    seqs_1hot, seq_headers, snps, seqs = basenji.vcf.snps_seq1(
-        snps, options.seq_len, options.genome1_fasta, return_seqs=True)
+    seqs_1hot, seq_headers, snps, seqs = vcf.snps_seq1(
+        snps, job['seq_length'], options.genome1_fasta, return_seqs=True)
   else:
-    seqs_1hot, seq_headers, snps, seqs = basenji.vcf.snps2_seq1(
-        snps,
-        options.seq_len,
-        options.genome1_fasta,
-        options.genome2_fasta,
-        return_seqs=True)
+    seqs_1hot, seq_headers, snps, seqs = vcf.snps2_seq1(
+        snps, job['seq_length'], options.genome1_fasta,
+        options.genome2_fasta, return_seqs=True)
 
   seqs_n = seqs_1hot.shape[0]
 
   #################################################################
   # setup model
   #################################################################
-  job = basenji.dna_io.read_job_params(params_file)
 
-  job['seq_length'] = seqs_1hot.shape[1]
-  job['seq_depth'] = seqs_1hot.shape[2]
+  if options.targets_file is None:
+    target_ids = ['t%d' % ti for ti in range(job['num_targets'])]
+    target_labels = ['']*len(target_ids)
+    target_subset = None
 
-  if 'num_targets' not in job or 'target_pool' not in job:
-    print(
-        'Must provide num_targets and target_pool in parameters file',
-        file=sys.stderr)
-    exit(1)
+  else:
+    targets_df = pd.read_csv(options.targets_file, sep='\t', index_col=0)
+    target_ids = targets_df.identifier
+    target_labels = targets_df.description
+    target_subset = targets_df.index
+    if len(target_subset) == job['num_targets']:
+        target_subset = None
 
-  # build model
-  dr = basenji.seqnn.SeqNN()
-  dr.build(job)
+  if not options.load_sat_npy:
+    # build model
+    model = seqnn.SeqNN()
+    model.build_feed_sad(job, ensemble_rc=options.rc,
+        ensemble_shifts=options.shifts, target_subset=target_subset)
 
-  # initialize saver
-  saver = tf.train.Saver()
+    # initialize saver
+    saver = tf.train.Saver()
 
   #################################################################
   # predict and process
   #################################################################
 
   with tf.Session() as sess:
-    # load variables into session
-    saver.restore(sess, model_file)
+    if not options.load_sat_npy:
+      # load variables into session
+      saver.restore(sess, model_file)
 
     for si in range(seqs_n):
       header = seq_headers[si]
@@ -213,29 +184,21 @@ def main():
 
       else:
         # supplement with saturated mutagenesis
-        sat_seqs_1hot = basenji_sat.satmut_seqs(seqs_1hot[si:si + 1],
-                                                options.satmut_len)
+        sat_seqs_1hot = satmut_seqs(seqs_1hot[si:si + 1], options.satmut_len)
 
         # initialize batcher
-        batcher_sat = basenji.batcher.Batcher(
-            sat_seqs_1hot, batch_size=dr.batch_size)
+        batcher_sat = batcher.Batcher(
+            sat_seqs_1hot, batch_size=model.hp.batch_size)
 
         # predict
-        sat_preds = dr.predict(
-            sess,
-            batcher_sat,
-            rc=options.rc,
-            shifts=options.shifts,
-            mc_n=options.mc_n,
-            target_indexes=target_indexes)
+        sat_preds = model.predict_h5(sess, batcher_sat)
         np.save('%s/seq%d_preds.npy' % (options.out_dir, si), sat_preds)
 
       #################################################################
       # compute delta, loss, and gain matrices
 
       # compute the matrix of prediction deltas: (4 x L_sm x T) array
-      sat_delta = basenji_sat.delta_matrix(seqs_1hot[si], sat_preds,
-                                           options.satmut_len)
+      sat_delta = delta_matrix(seqs_1hot[si], sat_preds, options.satmut_len)
 
       # sat_loss, sat_gain = loss_gain(sat_delta, sat_preds[si], options.satmut_len)
       sat_loss = sat_delta.min(axis=0)
@@ -244,10 +207,10 @@ def main():
       ##############################################
       # plot
 
-      for ti in range(len(target_indexes)):
+      for ti in range(len(target_subset)):
         # setup plot
         sns.set(style='white', font_scale=1)
-        spp = basenji_sat.subplot_params(sat_delta.shape[1])
+        spp = subplot_params(sat_delta.shape[1])
 
         if options.gain:
           plt.figure(figsize=(options.figure_width, 4))
@@ -274,18 +237,18 @@ def main():
               (3, spp['heat_cols']), (2, 0), colspan=spp['heat_cols'])
 
         # plot sequence logo
-        basenji_sat.plot_seqlogo(ax_logo_loss, seqs_1hot[si], -sat_loss[:, ti])
+        plot_seqlogo(ax_logo_loss, seqs_1hot[si], -sat_loss[:, ti])
         if options.gain:
-          basenji_sat.plot_seqlogo(ax_logo_gain, seqs_1hot[si], sat_gain[:, ti])
+          plot_seqlogo(ax_logo_gain, seqs_1hot[si], sat_gain[:, ti])
 
         # plot SAD
-        basenji_sat.plot_sad(ax_sad, sat_loss[:, ti], sat_gain[:, ti])
+        plot_sad(ax_sad, sat_loss[:, ti], sat_gain[:, ti])
 
         # plot heat map
-        basenji_sat.plot_heat(ax_heat, sat_delta[:, :, ti], options.min_limit)
+        plot_heat(ax_heat, sat_delta[:, :, ti], options.min_limit)
 
         plt.tight_layout()
-        plt.savefig('%s/%s_t%d.pdf' % (options.out_dir, header_fs, ti), dpi=600)
+        plt.savefig('%s/%s_t%d.pdf' % (options.out_dir, header_fs, target_subset[ti]), dpi=600)
         plt.close()
 
 

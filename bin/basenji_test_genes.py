@@ -39,8 +39,14 @@ import tensorflow as tf
 
 import stats
 
-import basenji
+from basenji import batcher
+from basenji import gene
+from basenji import genedata
+from basenji import seqnn
+from basenji import params
+from basenji import plots
 from basenji_test_reps import infer_replicates
+
 """basenji_test_genes.py
 
 Compute accuracy statistics for a trained model at gene TSSs.
@@ -106,13 +112,9 @@ def main():
       dest='replicate_labels_file',
       help=
       'Compare replicate experiments, aided by the given file with long labels')
-  parser.add_option(
-      '-t',
-      dest='target_indexes',
-      default=None,
-      help=
-      'File or Comma-separated list of target indexes to scatter plot true versus predicted values'
-  )
+  parser.add_option('-t', dest='targets_file',
+      default=None, type='str',
+      help='File specifying target indexes and labels in table format')
   parser.add_option(
       '--table',
       dest='print_tables',
@@ -150,7 +152,7 @@ def main():
   #################################################################
   # read in genes and targets
 
-  gene_data = basenji.genedata.GeneData(genes_hdf5_file)
+  gene_data = genedata.GeneData(genes_hdf5_file)
 
 
   #################################################################
@@ -165,7 +167,7 @@ def main():
     #######################################################
     # setup model
 
-    job = basenji.dna_io.read_job_params(params_file)
+    job = params.read_job_params(params_file)
 
     job['seq_length'] = gene_data.seq_length
     job['seq_depth'] = gene_data.seq_depth
@@ -174,11 +176,11 @@ def main():
       job['num_targets'] = gene_data.num_targets
 
     # build model
-    model = basenji.seqnn.SeqNN()
-    model.build(job)
+    model = seqnn.SeqNN()
+    model.build_feed_sad(job)
 
     if options.batch_size is not None:
-      model.batch_size = options.batch_size
+      model.hp.batch_size = options.batch_size
 
 
     #######################################################
@@ -189,8 +191,8 @@ def main():
     sys.stdout.flush()
 
     # initialize batcher
-    batcher = basenji.batcher.Batcher(
-        gene_data.seqs_1hot, batch_size=model.batch_size)
+    gene_batcher = batcher.Batcher(
+        gene_data.seqs_1hot, batch_size=model.hp.batch_size)
 
     # initialie saver
     saver = tf.train.Saver()
@@ -200,53 +202,39 @@ def main():
       saver.restore(sess, model_file)
 
       # predict
-      tss_preds = model.predict_genes(
-          sess,
-          batcher,
-          gene_data.gene_seqs,
-          rc=options.rc,
-          shifts=options.shifts,
-          tss_radius=options.tss_radius)
+      tss_preds = model.predict_genes(sess, gene_batcher, gene_data.gene_seqs,
+          rc=options.rc, shifts=options.shifts, tss_radius=options.tss_radius)
 
     # save to file
     np.save('%s/preds' % options.out_dir, tss_preds)
 
     print(' Done in %ds.' % (time.time() - t0))
 
+  # up-convert
+  tss_preds = tss_preds.astype('float32')
+
   #################################################################
   # convert to genes
 
-  gene_targets, _ = basenji.gene.map_tss_genes(gene_data.tss_targets, gene_data.tss,
-                                            tss_radius=options.tss_radius)
-  gene_preds, _ = basenji.gene.map_tss_genes(tss_preds, gene_data.tss,
-                                          tss_radius=options.tss_radius)
+  gene_targets, _ = gene.map_tss_genes(gene_data.tss_targets, gene_data.tss,
+                                       tss_radius=options.tss_radius)
+  gene_preds, _ = gene.map_tss_genes(tss_preds, gene_data.tss,
+                                     tss_radius=options.tss_radius)
 
 
   #################################################################
   # determine targets
 
-  # all targets
-  if options.target_indexes is None:
-    if gene_data.num_targets is None:
-      print('No targets to test against')
-      exit()
-    else:
-      options.target_indexes = np.arange(gene_data.num_targets)
-
-  # file targets
-  elif os.path.isfile(options.target_indexes):
-    target_indexes_file = options.target_indexes
-    options.target_indexes = []
-    for line in open(target_indexes_file):
-      options.target_indexes.append(int(line.split()[0]))
-
-  # comma-separated targets
+  # read targets
+  if options.targets_file is not None:
+    targets_df = pd.read_table(options.targets_file, index_col=0)
+    target_indexes = targets_df.index
   else:
-    options.target_indexes = [
-        int(ti) for ti in options.target_indexes.split(',')
-    ]
-
-  options.target_indexes = np.array(options.target_indexes)
+    if gene_data.num_targets is None:
+      print('No targets to test against.')
+      exit(1)
+    else:
+      target_indexes = np.arange(gene_data.num_targets)
 
   #################################################################
   # correlation statistics
@@ -256,12 +244,12 @@ def main():
   sys.stdout.flush()
 
   cor_table(gene_data.tss_targets, tss_preds, gene_data.target_ids,
-            gene_data.target_labels, options.target_indexes,
+            gene_data.target_labels, target_indexes,
             '%s/tss_cors.txt' % options.out_dir)
 
   cor_table(gene_targets, gene_preds, gene_data.target_ids,
-            gene_data.target_labels, options.target_indexes,
-            '%s/gene_cors.txt' % options.out_dir, plots=True)
+            gene_data.target_labels, target_indexes,
+            '%s/gene_cors.txt' % options.out_dir, draw_plots=True)
 
   print(' Done in %ds.' % (time.time() - t0))
 
@@ -274,12 +262,12 @@ def main():
     sys.stdout.flush()
 
     gene_table(gene_data.tss_targets, tss_preds, gene_data.tss_ids(),
-               gene_data.target_labels, options.target_indexes,
+               gene_data.target_labels, target_indexes,
                '%s/transcript' % options.out_dir, options.plot_scatter)
 
     gene_table(gene_targets, gene_preds,
                gene_data.gene_ids(), gene_data.target_labels,
-               options.target_indexes, '%s/gene' % options.out_dir,
+               target_indexes, '%s/gene' % options.out_dir,
                options.plot_scatter)
 
     print(' Done in %ds.' % (time.time() - t0))
@@ -295,8 +283,8 @@ def main():
     print('Normalizing values across targets.', end='')
     sys.stdout.flush()
 
-    gene_targets_qn = normalize_targets(gene_targets[:, options.target_indexes], log_pseudo=1)
-    gene_preds_qn = normalize_targets(gene_preds[:, options.target_indexes], log_pseudo=1)
+    gene_targets_qn = normalize_targets(gene_targets[:, target_indexes], log_pseudo=1)
+    gene_preds_qn = normalize_targets(gene_preds[:, target_indexes], log_pseudo=1)
 
     print(' Done in %ds.' % (time.time() - t0))
 
@@ -376,7 +364,7 @@ def main():
     # replicate_correlations(replicate_lists, gene_data.tss_targets,
         # tss_preds, options.target_indexes, '%s/transcript_reps' % options.out_dir)
     replicate_correlations(
-        replicate_lists, gene_targets, gene_preds, options.target_indexes,
+        replicate_lists, gene_targets, gene_preds, target_indexes,
         '%s/gene_reps' % options.out_dir)  # , scatter_plots=True)
 
   #################################################################
@@ -390,8 +378,8 @@ def main():
   # alternative TSS
 
   if options.tss_alt:
-    alternative_tss(gene_data.tss_targets[:,options.target_indexes],
-                    tss_preds[:,options.target_indexes], gene_data,
+    alternative_tss(gene_data.tss_targets[:,target_indexes],
+                    tss_preds[:,target_indexes], gene_data,
                     options.out_dir, log_pseudo=1)
 
 
@@ -484,12 +472,12 @@ def alternative_tss(tss_targets, tss_preds, gene_data, out_base, log_pseudo=1, t
     cor_i = cor_indexes[pct_i]
 
     out_pdf = '%s/tss12_q%d.pdf' % (out_base, qi)
-    basenji.plots.regplot(gene_tss12_targets[cor_i], gene_tss12_preds[cor_i],
-                            out_pdf, poly_order=1, alpha=0.8, point_size=8,
-                            square=False, figsize=(4,4),
-                            x_label='log2 Experiment TSS1/TSS2',
-                            y_label='log2 Prediction TSS1/TSS2',
-                            title=gene_ids[cor_i])
+    plots.regplot(gene_tss12_targets[cor_i], gene_tss12_preds[cor_i],
+                  out_pdf, poly_order=1, alpha=0.8, point_size=8,
+                  square=False, figsize=(4,4),
+                  x_label='log2 Experiment TSS1/TSS2',
+                  y_label='log2 Prediction TSS1/TSS2',
+                  title=gene_ids[cor_i])
 
     print(qi, gene_ids[cor_i], file=genes_out)
 
@@ -521,7 +509,7 @@ def cor_table(gene_targets,
               target_labels,
               target_indexes,
               out_file,
-              plots=False):
+              draw_plots=False):
   """ Print a table and plot the distribution of target correlations. """
 
   table_out = open(out_file, 'w')
@@ -556,15 +544,15 @@ def cor_table(gene_targets,
   cors_nz = np.array(cors_nz)
   table_out.close()
 
-  if plots:
+  if draw_plots:
     # plot correlation distribution
     out_base = os.path.splitext(out_file)[0]
     sns.set(style='ticks', font_scale=1.3)
 
     # plot correlations versus target signal
     gene_targets_log = np.log2(gene_targets[:, target_indexes] + 1)
-    target_signal = gene_targets_log.sum(axis=0)
-    basenji.plots.jointplot(
+    target_signal = gene_targets_log.sum(axis=0, dtype='float64')
+    plots.jointplot(
         target_signal,
         cors,
         '%s_sig.pdf' % out_base,
@@ -574,7 +562,7 @@ def cor_table(gene_targets,
         table=True)
 
     # plot nonzero correlations versus target signal
-    basenji.plots.jointplot(
+    plots.jointplot(
         target_signal,
         cors_nz,
         '%s_nz_sig.pdf' % out_base,
@@ -602,8 +590,11 @@ def gene_table(gene_targets, gene_preds, gene_iter, target_labels,
     if plot_scatter:
       sns.set(font_scale=1.3, style='ticks')
       out_pdf = '%s_scatter%d.pdf' % (out_prefix, ti)
-      ri = np.random.choice(range(num_genes), 2000, replace=False)
-      basenji.plots.regplot(
+      if num_genes < 2000:
+        ri = np.arange(num_genes)
+      else:
+        ri = np.random.choice(range(num_genes), 2000, replace=False)
+      plots.regplot(
           gti[ri],
           gpi[ri],
           out_pdf,
@@ -730,8 +721,11 @@ def replicate_correlations(replicate_lists,
       # scatter plot rep vs rep
       if scatter_plots:
         out_pdf = '%s_s%d.pdf' % (out_prefix, li)
-        gene_indexes = np.random.choice(range(num_genes), 1000, replace=False)
-        basenji.plots.regplot(
+        if num_genes < 1000:
+          gene_indexes = np.arange(num_genes)
+        else:
+          gene_indexes = np.random.choice(range(num_genes), 1000, replace=False)
+        plots.regplot(
             gene_targets_rep1[gene_indexes],
             gene_targets_rep2[gene_indexes],
             out_pdf,
@@ -753,7 +747,7 @@ def replicate_correlations(replicate_lists,
       if scatter_plots:
         # scatter plot rep vs pred
         out_pdf = '%s_s%d_rep1.pdf' % (out_prefix, li)
-        basenji.plots.regplot(
+        plots.regplot(
             gene_targets_rep1[gene_indexes],
             gene_preds_rep1[gene_indexes],
             out_pdf,
@@ -764,7 +758,7 @@ def replicate_correlations(replicate_lists,
 
         # scatter plot rep vs pred
         out_pdf = '%s_s%d_rep2.pdf' % (out_prefix, li)
-        basenji.plots.regplot(
+        plots.regplot(
             gene_targets_rep2[gene_indexes],
             gene_preds_rep2[gene_indexes],
             out_pdf,
@@ -792,7 +786,7 @@ def replicate_correlations(replicate_lists,
   pred_cors = np.array(pred_cors)
 
   out_pdf = '%s_scatter.pdf' % out_prefix
-  basenji.plots.jointplot(
+  plots.jointplot(
       rep_cors,
       pred_cors,
       out_pdf,
@@ -805,7 +799,7 @@ def quantile_accuracy(gene_targets, gene_preds, gene_stat, out_pdf, numq=4):
   ''' Plot accuracy (PearsonR) in quantile bins across targets. '''
 
   # plot PearsonR in variance statistic bins
-  quant_indexes = stats.quantile_indexes(gene_stat, numq)
+  quant_indexes = quantile_indexes(gene_stat, numq)
 
   quantiles_series = []
   targets_series = []
@@ -884,12 +878,38 @@ def quantile_accuracy(gene_targets, gene_preds, gene_stat, out_pdf, numq=4):
       print(qi, pqi, ti, target_ratios[ti], file=table_out)
 
       qout_pdf = '%s_pq%d_q%d.pdf' % (out_pdf[:-4], pqi, qi)
-      basenji.plots.jointplot(gene_targets_quant[:,ti], gene_preds_quant[:,ti],
+      plots.jointplot(gene_targets_quant[:,ti], gene_preds_quant[:,ti],
                               qout_pdf, alpha=0.8, point_size=8, kind='reg',
                               figsize=5, x_label='log2 Experiment',
                               y_label='log2 Prediction')
 
   table_out.close()
+
+
+def quantile_indexes(values, numq):
+  """ Return a list of lists of indexes referring to data points in the
+       corresponding quantiles."""
+  # obtain indexes sorted by value
+  indexes_sorted = np.argsort(values)
+
+  # determine max index of quantiles
+  quantile_maxes = np.linspace(0, len(values), numq+1).astype('int')[1:]
+
+  # initialize data structure
+  quant_indexes = []
+  for qmi in range(numq):
+    quant_indexes.append([])
+
+  qmi = 0
+  for i in range(len(values)):
+    if i >= quantile_maxes[qmi]:
+      # next quantile
+      qmi += 1
+
+    # append original index to this quantile's list
+    quant_indexes[qmi].append(indexes_sorted[i])
+
+  return quant_indexes
 
 
 def variance_accuracy(gene_targets, gene_preds, out_prefix, log_pseudo=None):
@@ -923,29 +943,29 @@ def variance_accuracy(gene_targets, gene_preds, out_prefix, log_pseudo=None):
 
   # plot mean vs std
   out_pdf = '%s_mean-std.pdf' % out_prefix
-  basenji.plots.jointplot(gene_mean[ri], gene_std[ri], out_pdf, point_size=10,
+  plots.jointplot(gene_mean[ri], gene_std[ri], out_pdf, point_size=10,
     cor='spearmanr', x_label='Mean across experiments', y_label='Std Dev across experiments')
 
   # plot mean vs MSE
   out_pdf = '%s_mean.pdf' % out_prefix
-  basenji.plots.jointplot(gene_mean[ri], gene_mse[ri], out_pdf, point_size=10,
+  plots.jointplot(gene_mean[ri], gene_mse[ri], out_pdf, point_size=10,
     cor='spearmanr', x_label='Mean across experiments', y_label='Mean squared prediction error')
 
   # plot std vs MSE
   out_pdf = '%s_std.pdf' % out_prefix
-  basenji.plots.jointplot(gene_std[ri], gene_mse[ri], out_pdf, point_size=10,
+  plots.jointplot(gene_std[ri], gene_mse[ri], out_pdf, point_size=10,
     cor='spearmanr', x_label='Std Dev across experiments', y_label='Mean squared prediction error')
 
   # plot CV vs MSE
   gene_cv = np.divide(gene_std, gene_mean)
   out_pdf = '%s_cv.pdf' % out_prefix
-  basenji.plots.jointplot(gene_cv[ri], gene_mse[ri], out_pdf, point_size=10,
+  plots.jointplot(gene_cv[ri], gene_mse[ri], out_pdf, point_size=10,
     cor='spearmanr', x_label='Coef Var across experiments', y_label='Mean squared prediction error')
 
 
   # plot MSE distributions in CV bins
   numq = 5
-  quant_indexes = stats.quantile_indexes(gene_cv, numq)
+  quant_indexes = quantile_indexes(gene_cv, numq)
   quant_mse = []
   for qi in range(numq):
     for gi in quant_indexes[qi]:
